@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WebSocket Tilt Sender</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 16px; }
+  .row { margin: 12px 0; }
+  #status { font-weight: bold; }
+  button { padding: 10px 14px; font-size: 16px; margin-right: 8px; }
+  pre { background: #f4f4f4; padding: 12px; border-radius: 8px; overflow:auto; }
+  .ok { color: #0a7; }
+  .ng { color: #c33; }
+</style>
+</head>
+<body>
+
+<h2>スマホ傾き → WebSocket送信</h2>
+
+<div class="row">
+  Status: <span id="status">-</span>
+</div>
+
+<div class="row">
+  <button id="btnPerm">センサー許可＆開始</button>
+  <button id="btnStop" disabled>停止</button>
+</div>
+
+<div class="row">
+  <div>alpha(方位): <span id="a">-</span></div>
+  <div>beta(前後): <span id="b">-</span></div>
+  <div>gamma(左右): <span id="g">-</span></div>
+</div>
+
+<div class="row">
+  <div>送信回数: <span id="cnt">0</span></div>
+  <div>最後に送信した時刻: <span id="lastT">-</span></div>
+</div>
+
+<div class="row">
+  <div>最後に送ったJSON:</div>
+  <pre id="lastSent">{}</pre>
+</div>
+
+<div class="row">
+  <div>ログ:</div>
+  <pre id="log"></pre>
+</div>
+
+<script>
+/** ★ここだけ必ず変更：PCのWi-Fi側IPv4にする（例 192.168.0.12） */
+const PC_IP = "172.24.53.23";
+const WS_URL = `ws://${PC_IP}:3000`;
+
+// ===== UI =====
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("log");
+const lastSentEl = document.getElementById("lastSent");
+const aEl = document.getElementById("a");
+const bEl = document.getElementById("b");
+const gEl = document.getElementById("g");
+const cntEl = document.getElementById("cnt");
+const lastTEl = document.getElementById("lastT");
+
+function log(msg) {
+  logEl.textContent += msg + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(text, ok) {
+  statusEl.textContent = text;
+  statusEl.className = ok ? "ok" : "ng";
+}
+
+// ===== State =====
+let ws = null;
+let reconnectTimer = null;
+let sensorAttached = false;
+let timerId = null;
+let sendCount = 0;
+let latest = { alpha: 0, beta: 0, gamma: 0 };
+
+// ===== Utils =====
+function round2(x) { return Math.round(x * 100) / 100; }
+function nowStr() { return new Date().toLocaleTimeString(); }
+
+function getScreenAngle() {
+  const so = window.screen.orientation;
+  if (so && typeof so.angle === "number") return so.angle;
+  if (typeof window.orientation === "number") return window.orientation;
+  return 0;
+}
+
+function onOrientation(e) {
+  if (e.alpha == null || e.beta == null || e.gamma == null) return;
+  latest.alpha = round2(e.alpha);
+  latest.beta  = round2(e.beta);
+  latest.gamma = round2(e.gamma);
+  aEl.textContent = latest.alpha;
+  bEl.textContent = latest.beta;
+  gEl.textContent = latest.gamma;
+}
+
+// ===== WebSocket =====
+function connectWS() {
+  // 既にOPEN/CONNECTINGなら触らない
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+  setStatus("connecting...", false);
+  log(`WS connect -> ${WS_URL}`);
+
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    setStatus("connected", true);
+    log("WS open");
+  };
+
+  ws.onerror = () => {
+    // iOS Safariは詳細が取れないことが多い
+    setStatus("error", false);
+    log("WS error (IP/ポート/ファイアウォール/同一Wi-Fi確認)");
+  };
+
+  ws.onclose = (e) => {
+    setStatus(`closed (code=${e.code})`, false);
+    log(`WS close code=${e.code} wasClean=${e.wasClean} reason=${e.reason || "-"}`);
+
+    // ★自動再接続（1006でも戻る）
+    scheduleReconnect();
+  };
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWS();
+  }, 2000);
+  log("Reconnecting in 2s...");
+}
+
+// ===== Sending Loop =====
+function startSendingLoop() {
+  if (timerId) return;
+
+  timerId = setInterval(() => {
+    // OPENのときだけ送信
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    const payload = {
+      type: "tilt",
+      t: Date.now(),
+      screenAngle: getScreenAngle(),
+      alpha: latest.alpha,
+      beta: latest.beta,
+      gamma: latest.gamma,
+    };
+
+    const json = JSON.stringify(payload);
+
+    try {
+      ws.send(json);
+      lastSentEl.textContent = json;
+      sendCount++;
+      cntEl.textContent = String(sendCount);
+      lastTEl.textContent = nowStr();
+    } catch (err) {
+      log("send error: " + err);
+    }
+  }, 33);
+
+  document.getElementById("btnStop").disabled = false;
+  log("Send loop started (33ms)");
+}
+
+function stopAll() {
+  if (timerId) { clearInterval(timerId); timerId = null; log("Send loop stopped"); }
+  if (sensorAttached) { window.removeEventListener("deviceorientation", onOrientation); sensorAttached = false; log("Sensor stopped"); }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { try { ws.close(); } catch {} ws = null; log("WS close called"); }
+  document.getElementById("btnStop").disabled = true;
+  setStatus("stopped", false);
+}
+
+// ===== iOS Permission + Start =====
+async function requestPermissionAndStart() {
+  // iOS 13+ はユーザー操作内で許可が必要
+  const DO = window.DeviceOrientationEvent;
+
+  if (!DO) {
+    alert("DeviceOrientationEvent が利用できません（ブラウザ/制限の可能性）");
+    return;
+  }
+
+  if (typeof DO.requestPermission === "function") {
+    try {
+      const state = await DO.requestPermission();
+      log("Permission: " + state);
+      if (state !== "granted") {
+        alert("許可されませんでした。設定→Safari→モーションと方向へのアクセスをONにしてね。");
+        return;
+      }
+    } catch (err) {
+      alert("センサー許可でエラー: " + err);
+      return;
+    }
+  } else {
+    log("Permission API not needed");
+  }
+
+  // センサー開始
+  if (!sensorAttached) {
+    window.addEventListener("deviceorientation", onOrientation);
+    sensorAttached = true;
+    log("DeviceOrientation listener added");
+  }
+
+  // WS接続 + 送信開始
+  connectWS();
+  startSendingLoop();
+}
+
+document.getElementById("btnPerm").addEventListener("click", requestPermissionAndStart);
+document.getElementById("btnStop").addEventListener("click", stopAll);
+
+// 初期：接続だけ試す（失敗しても再接続される）
+connectWS();
+</script>
+
+</body>
+</html>
